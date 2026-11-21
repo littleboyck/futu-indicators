@@ -1,0 +1,369 @@
+# -*- coding: utf-8 -*-
+"""Trend Indicator A (v2.3) —— 富途牛牛 / moomoo「自编指标」Python 模式（主图）
+
+按 DZIV 的 Pine v5 原版翻译（CC BY-NC-SA 4.0）：
+    1. 先把手上的 OHLC 转成 Heikin-Ashi（递归：ha_open = (前ha_open + 前ha_close)/2，
+       ha_close = (o+h+l+c)/4，ha_high/low 取与原高低价的极值）；
+    2. 对 HA 的 open/close/high/low 各做一次同类型均线；
+    3. trend = 100 × (ma_close − ma_open) / (ma_high − ma_low)，
+       多头为正、空头为负，仅用来上色；
+    4. 主图画 ma_close 线（多头绿 #26A69A / 空头红 #EF5350）；高低线默认关闭。
+       云带用 plot_fillcolor 填：val1/val2 必须是平台自己的序列对象，
+       用 `close() * 1.0` 造壳再逐根赋值即可，直接传普通 list 会报
+       期望Sequence[int,float,nan]/int/float，得到'list'。
+       填充色带 alpha（Color(r,g,b,a)），否则会把 K 线盖住。
+
+均线类型用数字选：1=EMA(默认) 2=SMA 3=WMA 4=ZLEMA 5=HMA 6=ALMA 7=VWMA 8=SWMA。
+
+富途内核约束：
+    - input_parameter 只能放模块顶层；plot / plot_fillcolor 不能出现在局部作用域
+      （含 try 块），否则报「xx函数不允许出现在局部作用域」。
+    - 不支持推导式 / lambda / 三元表达式 / **；空值用 math.nan。
+"""
+
+indicator("AV2", "Trend Indicator A v2.3", True,
+          "Heikin-Ashi 均线趋势带：多头绿、空头红，开收盘之间填云")
+
+_MA_TYPE = input_parameter("MA类型1EMA2SMA3WMA4ZLEMA5HMA6ALMA7VWMA8SWMA", 1)
+_MA_LEN = input_parameter("MA周期", 9)
+_SHOW_HL = input_parameter("显示高低线0关1开", 0)
+_SHOW_FILL = input_parameter("显示云带0关1开", 1)
+_OPACITY = input_parameter("线透明度%", 50)
+_SMOOTH = input_parameter("曲线平滑(0关)", 5)
+
+import math
+from ftool import iff
+
+NAN = float("nan")
+
+_C_POS = Color.hex("#26A69A")
+_C_NEG = Color.hex("#EF5350")
+_C_NEU = Color.hex("#808080")
+# 云带用带 alpha 的颜色，否则会盖住 K 线
+_F_POS = Color(38, 166, 154, 45)
+_F_NEG = Color(239, 83, 80, 45)
+_F_NEU = Color(128, 128, 128, 35)
+
+
+def _isna(v):
+    return v != v
+
+
+def _sma(vals, n):
+    out = []
+    for i in range(len(vals)):
+        out.append(NAN)
+    if n < 1:
+        n = 1
+    for i in range(len(vals)):
+        if i + 1 < n:
+            continue
+        s = 0.0
+        ok = True
+        for j in range(i - n + 1, i + 1):
+            if _isna(vals[j]):
+                ok = False
+                break
+            s = s + vals[j]
+        if ok:
+            out[i] = s / n
+    return out
+
+
+def _ema(vals, n):
+    out = []
+    for i in range(len(vals)):
+        out.append(NAN)
+    if n < 1:
+        n = 1
+    k = 2.0 / (n + 1.0)
+    prev = NAN
+    for i in range(len(vals)):
+        v = vals[i]
+        if _isna(v):
+            continue
+        if _isna(prev):
+            prev = v
+        else:
+            prev = prev + (v - prev) * k
+        out[i] = prev
+    return out
+
+
+def _wma(vals, n):
+    out = []
+    for i in range(len(vals)):
+        out.append(NAN)
+    if n < 1:
+        n = 1
+    den = n * (n + 1) / 2.0
+    for i in range(len(vals)):
+        if i + 1 < n:
+            continue
+        s = 0.0
+        ok = True
+        w = 1.0
+        for j in range(i - n + 1, i + 1):
+            if _isna(vals[j]):
+                ok = False
+                break
+            s = s + vals[j] * w
+            w = w + 1.0
+        if ok:
+            out[i] = s / den
+    return out
+
+
+def _zlema(vals, n):
+    # ta.ema(x + x - x[floor((n-1)/2)], n)
+    if n < 1:
+        n = 1
+    lag = int((n - 1) / 2)
+    src = []
+    for i in range(len(vals)):
+        if i - lag < 0:
+            src.append(NAN)
+        else:
+            src.append(vals[i] + vals[i] - vals[i - lag])
+    return _ema(src, n)
+
+
+def _hma(vals, n):
+    if n < 2:
+        n = 2
+    half = int(n / 2)
+    root = int(math.sqrt(n))
+    if root < 1:
+        root = 1
+    w1 = _wma(vals, half)
+    w2 = _wma(vals, n)
+    diff = []
+    for i in range(len(vals)):
+        if _isna(w1[i]) or _isna(w2[i]):
+            diff.append(NAN)
+        else:
+            diff.append(2.0 * w1[i] - w2[i])
+    return _wma(diff, root)
+
+
+def _alma(vals, n, offset, sigma):
+    if n < 1:
+        n = 1
+    m = offset * (n - 1)
+    s = n / float(sigma)
+    wts = []
+    tot = 0.0
+    for i in range(n):
+        d = i - m
+        w = math.exp(-(d * d) / (2.0 * s * s))
+        wts.append(w)
+        tot = tot + w
+    out = []
+    for i in range(len(vals)):
+        out.append(NAN)
+    for i in range(len(vals)):
+        if i + 1 < n:
+            continue
+        acc = 0.0
+        ok = True
+        for j in range(n):
+            v = vals[i - n + 1 + j]
+            if _isna(v):
+                ok = False
+                break
+            acc = acc + v * wts[j]
+        if ok:
+            out[i] = acc / tot
+    return out
+
+
+def _vwma(vals, vols, n):
+    out = []
+    for i in range(len(vals)):
+        out.append(NAN)
+    if n < 1:
+        n = 1
+    for i in range(len(vals)):
+        if i + 1 < n:
+            continue
+        sv = 0.0
+        sw = 0.0
+        ok = True
+        for j in range(i - n + 1, i + 1):
+            if _isna(vals[j]) or _isna(vols[j]):
+                ok = False
+                break
+            sv = sv + vals[j] * vols[j]
+            sw = sw + vols[j]
+        if ok and sw != 0.0:
+            out[i] = sv / sw
+    return out
+
+
+def _swma(vals):
+    # 对称加权 [1,2,3,4]/10，最新的权重最大
+    out = []
+    for i in range(len(vals)):
+        out.append(NAN)
+    for i in range(3, len(vals)):
+        out[i] = (vals[i - 3] * 1.0 + vals[i - 2] * 2.0 + vals[i - 1] * 3.0 + vals[i] * 4.0) / 10.0
+    return out
+
+
+def _ma(vals, mtype, n):
+    vols = VOLS
+    if mtype == 2:
+        return _sma(vals, n)
+    if mtype == 3:
+        return _wma(vals, n)
+    if mtype == 4:
+        return _zlema(vals, n)
+    if mtype == 5:
+        return _hma(vals, n)
+    if mtype == 6:
+        return _alma(vals, n, 0.85, 6)
+    if mtype == 7:
+        return _vwma(vals, vols, n)
+    if mtype == 8:
+        return _swma(vals)
+    return _ema(vals, n)
+
+
+VOLS = []
+
+
+if __name__ == "__main__":
+    _o = open()
+    _h = high()
+    _l = low()
+    _c = close()
+    _v = vol()
+    _n = len(_c)
+
+    VOLS = []
+    for _i in range(_n):
+        VOLS.append(float(_v[_i]))
+
+    _raw_o = []
+    _raw_h = []
+    _raw_l = []
+    _raw_c = []
+    for _i in range(_n):
+        _raw_o.append(float(_o[_i]))
+        _raw_h.append(float(_h[_i]))
+        _raw_l.append(float(_l[_i]))
+        _raw_c.append(float(_c[_i]))
+
+    # Heikin-Ashi 递归
+    _ha_c = []
+    _ha_o = []
+    _ha_h = []
+    _ha_l = []
+    _pc = NAN
+    _po = NAN
+    for _i in range(_n):
+        _hc = (_raw_o[_i] + _raw_h[_i] + _raw_l[_i] + _raw_c[_i]) / 4.0
+        if _i == 0:
+            _ho = (_raw_o[_i] + _raw_c[_i]) / 2.0
+        else:
+            _ho = (_po + _pc) / 2.0
+        _hh = _raw_h[_i]
+        if _ho > _hh:
+            _hh = _ho
+        if _hc > _hh:
+            _hh = _hc
+        _hl = _raw_l[_i]
+        if _ho < _hl:
+            _hl = _ho
+        if _hc < _hl:
+            _hl = _hc
+        _ha_c.append(_hc)
+        _ha_o.append(_ho)
+        _ha_h.append(_hh)
+        _ha_l.append(_hl)
+        _pc = _hc
+        _po = _ho
+
+    _type = int(_MA_TYPE)
+    _len = int(_MA_LEN)
+    if _len < 1:
+        _len = 1
+
+    _ma_o = _ma(_ha_o, _type, _len)
+    _ma_c = _ma(_ha_c, _type, _len)
+    _ma_h = _ma(_ha_h, _type, _len)
+    _ma_l = _ma(_ha_l, _type, _len)
+
+    # 曲线化：富途的点与点之间是直线段，画不出真贝塞尔；这里在数据层再跑一道
+    # EMA 平滑，把每根之间的折角抹圆，视觉上就是一条曲线（0 = 关闭，回到原版数值）。
+    _sm = int(_SMOOTH)
+    if _sm >= 2:
+        _ma_o = _ema(_ma_o, _sm)
+        _ma_c = _ema(_ma_c, _sm)
+        _ma_h = _ema(_ma_h, _sm)
+        _ma_l = _ema(_ma_l, _sm)
+
+    # trend 只用来上色；分母为 0 时按 0 处理
+    _trend = []
+    for _i in range(_n):
+        _den = _ma_h[_i] - _ma_l[_i]
+        if _isna(_den) or _isna(_ma_c[_i]) or _isna(_ma_o[_i]) or _den == 0.0:
+            _trend.append(0.0)
+        else:
+            _trend.append(100.0 * (_ma_c[_i] - _ma_o[_i]) / _den)
+
+    _s_close = _c * 0.0
+    _s_high = _c * 0.0
+    _s_low = _c * 0.0
+    for _i in range(_n):
+        _s_close[_i] = _ma_c[_i]
+        if int(_SHOW_HL) == 1:
+            _s_high[_i] = _ma_h[_i]
+            _s_low[_i] = _ma_l[_i]
+        else:
+            _s_high[_i] = NAN
+            _s_low[_i] = NAN
+
+    # 云带/上色的输入必须用平台序列（普通 list 会被 plot_fillcolor 拒收）
+    _s_ma_o = _c * 1.0
+    _s_ma_c = _c * 1.0
+    _s_ma_h = _c * 1.0
+    _s_ma_l = _c * 1.0
+    _s_trend = _c * 1.0
+    for _i in range(_n):
+        _s_ma_o[_i] = _ma_o[_i]
+        _s_ma_c[_i] = _ma_c[_i]
+        _s_ma_h[_i] = _ma_h[_i]
+        _s_ma_l[_i] = _ma_l[_i]
+        _s_trend[_i] = _trend[_i]
+
+    # 参数是「透明度百分比」：70 表示 70% 透明，alpha 只剩 30%
+    _a = int(255.0 * (100.0 - float(_OPACITY)) / 100.0)
+    if _a < 16:
+        _a = 16
+    if _a > 255:
+        _a = 255
+    _col_pos = Color(38, 166, 154, _a)
+    _col_neg = Color(239, 83, 80, _a)
+    _color = iff(_s_trend > 0.0, _col_pos, _col_neg)
+
+    plot("收盘线", _s_close, color=_color, style=Line.line, linewidth=2)
+    plot("高线", _s_high, color=_C_NEU, linewidth=1)
+    plot("低线", _s_low, color=_C_NEU, linewidth=1)
+
+    # 云带：HA 开盘/收盘均线之间填色（多头绿、空头红），高低影线各一层灰
+    _cond_pos = _s_trend > 0.0
+    _cond_neg = _s_trend <= 0.0
+    _cond_hl_pos = _s_ma_h > _s_ma_o
+    _cond_hl_neg = _s_ma_l < _s_ma_o
+    if int(_SHOW_FILL) != 1:
+        _cond_pos = _s_trend > 1e9
+        _cond_neg = _s_trend > 1e9
+        _cond_hl_pos = _cond_neg
+        _cond_hl_neg = _cond_neg
+    plot_fillcolor("云带多", _s_ma_o, _s_ma_c, _cond_pos, color=_F_POS)
+    plot_fillcolor("云带空", _s_ma_o, _s_ma_c, _cond_neg, color=_F_NEG)
+    plot_fillcolor("上影云", _s_ma_h, _s_ma_o, _cond_hl_pos, color=_F_NEU)
+    plot_fillcolor("下影云", _s_ma_l, _s_ma_o, _cond_hl_neg, color=_F_NEU)
+
+    output_parameter(收盘线=_s_close, 趋势强度=_s_trend)
